@@ -10,7 +10,24 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { normalizeTurns, type Row } from "./timeline";
-import { GRAPH_CHANGED, type GraphChangedPayload } from "./shared";
+import {
+  GRAPH_CHANGED,
+  MAX_OVERRIDES,
+  MAX_PRESETS,
+  MAX_SAVED_VIEWS,
+  type GraphChangedPayload,
+  type Preset,
+  type ViewState,
+} from "./shared";
+import {
+  buildFacets,
+  FACET_KEYS,
+  isHidden,
+  normalizeFilter,
+  threadKind,
+  type ThreadFacts,
+  type ThreadFilter,
+} from "./filters";
 
 const nodeKindSchema = z.enum([
   "root",
@@ -50,21 +67,102 @@ export type GraphNode = z.infer<typeof graphNodeSchema>;
 export type NodeKind = z.infer<typeof nodeKindSchema>;
 export type NodeStatus = z.infer<typeof nodeStatusSchema>;
 
+const facetValueSchema = z.object({
+  value: z.string(),
+  label: z.string(),
+  count: z.number(),
+  color: z.string().nullable().optional(),
+});
+const facetsSchema = z.object(
+  Object.fromEntries(FACET_KEYS.map((key) => [key, z.array(facetValueSchema)])) as Record<
+    (typeof FACET_KEYS)[number],
+    z.ZodArray<typeof facetValueSchema>
+  >,
+);
+const filterSchema = z.object(
+  Object.fromEntries(
+    FACET_KEYS.map((key) => [key, z.array(z.string().max(200)).max(500).optional()]),
+  ) as Record<(typeof FACET_KEYS)[number], z.ZodOptional<z.ZodArray<z.ZodString>>>,
+);
+
 const graphSchema = z.object({
   nodes: z.array(graphNodeSchema),
   generatedAt: z.number(),
   truncated: z.boolean(),
+  /** What the overview can be filtered on; null for a single-thread graph. */
+  facets: facetsSchema.nullable(),
+  /** Threads the filter hid from the overview. */
+  filteredOut: z.number(),
 });
 export type Graph = z.infer<typeof graphSchema>;
+
+const viewStateSchema = z.object({
+  baseline: z.enum(["default", "expanded", "collapsed"]),
+  overrides: z.record(z.string(), z.boolean()),
+  activeOnly: z.boolean(),
+  colorMode: z.enum(["type", "status"]),
+  filter: filterSchema.optional(),
+  viewport: z
+    .object({ x: z.number(), y: z.number(), scale: z.number().min(0.05).max(10) })
+    .nullable(),
+});
+const presetSchema = z.object({
+  name: z.string(),
+  state: viewStateSchema,
+  savedAt: z.number(),
+});
+const viewKeySchema = z.string().min(1).max(200);
+const presetNameSchema = z.string().trim().min(1).max(60);
 
 export const rpcContract = defineRpcContract({
   graph: {
     input: z.object({
       threadId: z.string().nullable(),
+      /** Overview only: values to hide. */
+      filter: filterSchema.optional(),
     }),
     output: graphSchema,
   },
+  /** Called by Labels Pro after label changes (plugin to plugin). */
+  labelsChanged: {
+    input: z.unknown(),
+    output: z.object({ ok: z.boolean() }),
+  },
+  /** The saved state of one view; `fallbackKey` is read when `key` has none. */
+  viewGet: {
+    input: z.object({ key: viewKeySchema, fallbackKey: viewKeySchema.nullable() }),
+    output: z.object({ state: viewStateSchema.nullable(), fromFallback: z.boolean() }),
+  },
+  /** Save one view; `alsoKey` gets the same state (the fallback for new views). */
+  viewSet: {
+    input: z.object({
+      key: viewKeySchema,
+      alsoKey: viewKeySchema.nullable(),
+      state: viewStateSchema,
+    }),
+    output: z.object({ ok: z.boolean() }),
+  },
+  presetsList: {
+    input: z.object({}),
+    output: z.array(presetSchema),
+  },
+  /** Save a preset; a preset with the same name is replaced. */
+  presetSave: {
+    input: z.object({ name: presetNameSchema, state: viewStateSchema }),
+    output: z.array(presetSchema),
+  },
+  presetDelete: {
+    input: z.object({ name: z.string() }),
+    output: z.array(presetSchema),
+  },
 });
+
+/** Keep the newest per-node choices only, so a long-lived view stays small. */
+function trimState(state: ViewState): ViewState {
+  const entries = Object.entries(state.overrides);
+  if (entries.length <= MAX_OVERRIDES) return state;
+  return { ...state, overrides: Object.fromEntries(entries.slice(-MAX_OVERRIDES)) };
+}
 
 
 type ThreadDto = {
@@ -74,6 +172,7 @@ type ThreadDto = {
   titleFallback: string | null;
   status: string;
   parentThreadId: string | null;
+  originPluginId?: string | null;
   providerId: string | null;
   updatedAt: number;
   createdAt: number;
@@ -87,6 +186,8 @@ const TEXT_CAP = 1500;
 const LABEL_CAP = 80;
 const MAX_WORK_PER_TURN = 40;
 const OVERVIEW_WORK_LIMIT = 6;
+/** Thread labels come from this plugin, when installed. */
+const LABELS_PLUGIN_ID = "labels-pro";
 const MAX_NODES = 1500;
 const RUNNING_THREAD_STATUSES = new Set(["active", "starting", "pending"]);
 const DELTA_EVENTS = new Set([
@@ -568,6 +669,7 @@ export default async function plugin(bb: BbPluginApi) {
   function threadNode(
     thread: ThreadDto,
     parentId: string | null,
+    labels: string[] = [],
   ): Omit<GraphNode, "meta"> & { meta: Record<string, string> } {
     return {
       id: thread.id,
@@ -590,6 +692,7 @@ export default async function plugin(bb: BbPluginApi) {
         ...(thread.environmentBranchName
           ? { branch: thread.environmentBranchName }
           : {}),
+        ...(labels.length > 0 ? { labels: labels.join(", ") } : {}),
       },
     };
   }
@@ -601,6 +704,7 @@ export default async function plugin(bb: BbPluginApi) {
     byParent: Map<string, ThreadDto[]>,
     parentIdFor: (thread: ThreadDto) => string | null,
     turns: number,
+    labelNames: (thread: ThreadDto) => string[] = () => [],
   ) {
     const ordered: ThreadDto[] = [];
     const visit = (thread: ThreadDto, depth: number) => {
@@ -618,7 +722,7 @@ export default async function plugin(bb: BbPluginApi) {
         thread.parentThreadId && orderedIds.has(thread.parentThreadId)
           ? thread.parentThreadId
           : parentIdFor(thread);
-      if (!builder.add(threadNode(thread, parentId))) return;
+      if (!builder.add(threadNode(thread, parentId, labelNames(thread)))) return;
       builder.addTurns(
         rows[index]!,
         thread.id,
@@ -637,20 +741,109 @@ export default async function plugin(bb: BbPluginApi) {
     return Array.isArray(result) ? result : [];
   }
 
-  async function buildOverview(): Promise<Graph> {
+  // Thread labels come from the Labels Pro plugin when it is installed. Its
+  // revision tells us cheaply whether anything changed since the last read.
+  type LabelIndex = {
+    revision: number;
+    labels: Map<string, { name: string; slug: string; color: string | null }>;
+    byThread: Map<string, string[]>;
+  };
+  let labelIndex: LabelIndex | null = null;
+  const labelsOut = z.object({
+    revision: z.number(),
+    changed: z.boolean(),
+    labels: z
+      .array(
+        z.object({ id: z.string(), name: z.string(), slug: z.string(), color: z.string().nullable() }).passthrough(),
+      )
+      .nullable(),
+    assignments: z
+      .array(z.object({ labelId: z.string(), threadIds: z.array(z.string()) }))
+      .nullable(),
+  });
+  async function threadLabels(): Promise<LabelIndex | null> {
+    try {
+      const result = await bb.sdk.plugins.callRpc({
+        pluginId: LABELS_PLUGIN_ID,
+        method: "listAssignments",
+        input: labelIndex ? { sinceRevision: labelIndex.revision } : {},
+        outputSchema: labelsOut,
+      });
+      if (!result.changed && labelIndex) return labelIndex;
+      const byThread = new Map<string, string[]>();
+      for (const { labelId, threadIds } of result.assignments ?? []) {
+        for (const threadId of threadIds) {
+          const list = byThread.get(threadId) ?? [];
+          list.push(labelId);
+          byThread.set(threadId, list);
+        }
+      }
+      labelIndex = {
+        revision: result.revision,
+        labels: new Map(
+          (result.labels ?? []).map((label) => [
+            label.id,
+            { name: label.name, slug: label.slug, color: label.color },
+          ]),
+        ),
+        byThread,
+      };
+      return labelIndex;
+    } catch {
+      // Labels Pro is not installed or not running: no label filter.
+      labelIndex = null;
+      return null;
+    }
+  }
+
+  async function buildOverview(rawFilter: ThreadFilter): Promise<Graph> {
+    const filter = normalizeFilter(rawFilter);
     const builder = new GraphBuilder(OVERVIEW_WORK_LIMIT);
-    const [threads, projects] = await Promise.all([
+    const [threads, projects, labels] = await Promise.all([
       allThreads(),
       bb.sdk.projects.list({ includePersonal: true }) as unknown as Promise<
         Array<{ id: string; name?: string | null }>
       >,
+      threadLabels(),
     ]);
+    const projectNames = new Map(
+      (Array.isArray(projects) ? projects : []).map((project) => [
+        project.id,
+        project.name ?? project.id,
+      ]),
+    );
     const cutoff = Date.now() - config.windowHours * 3_600_000;
-    const recent = threads
-      .filter(
-        (thread) =>
-          threadStatus(thread) !== "idle" || thread.updatedAt >= cutoff,
-      )
+    const windowed = threads.filter(
+      (thread) => threadStatus(thread) !== "idle" || thread.updatedAt >= cutoff,
+    );
+    const factsOf = (thread: ThreadDto): ThreadFacts => {
+      const labelIds = labels?.byThread.get(thread.id) ?? [];
+      return {
+        project: thread.projectId,
+        labels: labelIds,
+        kind: threadKind({
+          originPluginId: thread.originPluginId,
+          parentThreadId: thread.parentThreadId,
+          title: thread.title,
+          labelSlugs: labelIds.map((id) => labels?.labels.get(id)?.slug ?? ""),
+        }),
+        status: threadStatus(thread),
+        provider: thread.providerId ?? "",
+      };
+    };
+    const facts = new Map(windowed.map((thread) => [thread.id, factsOf(thread)]));
+    const facets = buildFacets([...facts.values()], filter, {
+      project: (id) => projectNames.get(id) ?? id,
+      label: (id) => labels?.labels.get(id) ?? null,
+    });
+    if (!labels) facets.label = [];
+    // Filter before the thread cap, so hidden threads make room for others.
+    const shown = windowed.filter((thread) => !isHidden(facts.get(thread.id)!, filter));
+    const labelNames = (thread: ThreadDto) =>
+      (facts.get(thread.id)?.labels ?? [])
+        .map((id) => labels?.labels.get(id)?.name)
+        .filter((name): name is string => Boolean(name));
+    const recent = shown
       .sort((a, b) => b.updatedAt - a.updatedAt)
       .slice(0, Math.max(1, config.maxThreads));
     const included = new Set(recent.map((thread) => thread.id));
@@ -680,12 +873,6 @@ export default async function plugin(bb: BbPluginApi) {
       input: null,
       output: null,
     });
-    const projectNames = new Map(
-      (Array.isArray(projects) ? projects : []).map((project) => [
-        project.id,
-        project.name ?? project.id,
-      ]),
-    );
     for (const projectId of new Set(roots.map((thread) => thread.projectId))) {
       const projectThreads = recent.filter(
         (thread) => thread.projectId === projectId,
@@ -715,11 +902,14 @@ export default async function plugin(bb: BbPluginApi) {
       byParent,
       (thread) => `project:${thread.projectId}`,
       Math.max(0, config.overviewTurns),
+      labelNames,
     );
     return {
       nodes: builder.nodes,
       generatedAt: Date.now(),
       truncated: builder.truncated,
+      facets,
+      filteredOut: windowed.length - shown.length,
     };
   }
 
@@ -757,6 +947,8 @@ export default async function plugin(bb: BbPluginApi) {
       nodes: builder.nodes,
       generatedAt: Date.now(),
       truncated: builder.truncated,
+      facets: null,
+      filteredOut: 0,
     };
   }
 
@@ -764,11 +956,11 @@ export default async function plugin(bb: BbPluginApi) {
   // share one in-flight build per scope and reuse it for a moment after.
   const BUILD_MEMO_MS = 750;
   const buildCache = new Map<string, { at: number; promise: Promise<Graph> }>();
-  function graphFor(threadId: string | null): Promise<Graph> {
-    const key = threadId ?? "*";
+  function graphFor(threadId: string | null, filter: ThreadFilter = {}): Promise<Graph> {
+    const key = threadId ?? `*${JSON.stringify(normalizeFilter(filter))}`;
     const cached = buildCache.get(key);
     if (cached && Date.now() - cached.at < BUILD_MEMO_MS) return cached.promise;
-    const promise = threadId === null ? buildOverview() : buildThread(threadId);
+    const promise = threadId === null ? buildOverview(filter) : buildThread(threadId);
     buildCache.set(key, { at: Date.now(), promise });
     promise.catch(() => buildCache.delete(key));
     if (buildCache.size > 50) {
@@ -778,8 +970,77 @@ export default async function plugin(bb: BbPluginApi) {
     return promise;
   }
 
+  // Saved views and presets live in the plugin's key-value store, so they
+  // follow the user between the desktop app and a browser. Writes run one at
+  // a time so the index of saved views never loses an update.
+  const VIEW_PREFIX = "view:";
+  const VIEW_INDEX_KEY = "views:index";
+  const PRESETS_KEY = "presets";
+  const kv = bb.storage.kv;
+  let writes: Promise<unknown> = Promise.resolve();
+  const serialized = <T>(task: () => Promise<T>): Promise<T> => {
+    const run = writes.then(task, task);
+    writes = run.catch(() => undefined);
+    return run;
+  };
+  const readView = async (key: string): Promise<ViewState | null> => {
+    const parsed = viewStateSchema.safeParse(await kv.get(VIEW_PREFIX + key));
+    return parsed.success ? parsed.data : null;
+  };
+  const readPresets = async (): Promise<Preset[]> => {
+    const parsed = z.array(presetSchema).safeParse(await kv.get(PRESETS_KEY));
+    return parsed.success ? parsed.data : [];
+  };
+  const writeViews = (keys: string[], state: ViewState) =>
+    serialized(async () => {
+      const trimmed = trimState(state);
+      const index =
+        (await kv.get<Array<{ key: string; at: number }>>(VIEW_INDEX_KEY)) ?? [];
+      const now = Date.now();
+      const next = [
+        ...index.filter((entry) => !keys.includes(entry.key)),
+        ...keys.map((key) => ({ key, at: now })),
+      ];
+      // Drop the least recently saved views past the cap.
+      const dropped = next.length > MAX_SAVED_VIEWS ? next.splice(0, next.length - MAX_SAVED_VIEWS) : [];
+      for (const key of keys) await kv.set(VIEW_PREFIX + key, trimmed);
+      for (const entry of dropped) await kv.delete(VIEW_PREFIX + entry.key);
+      await kv.set(VIEW_INDEX_KEY, next);
+    });
+
   bb.rpc.register(rpcContract, {
-    graph: ({ threadId }) => graphFor(threadId),
+    graph: ({ threadId, filter }) => graphFor(threadId, filter),
+    labelsChanged: () => {
+      labelIndex = null;
+      buildCache.clear();
+      bb.realtime.publish(GRAPH_CHANGED, { threadIds: [] } satisfies GraphChangedPayload);
+      return { ok: true };
+    },
+    viewGet: async ({ key, fallbackKey }) => {
+      const state = await readView(key);
+      if (state) return { state, fromFallback: false };
+      const fallback = fallbackKey ? await readView(fallbackKey) : null;
+      return { state: fallback, fromFallback: fallback !== null };
+    },
+    viewSet: async ({ key, alsoKey, state }) => {
+      await writeViews(alsoKey && alsoKey !== key ? [key, alsoKey] : [key], state);
+      return { ok: true };
+    },
+    presetsList: () => readPresets(),
+    presetSave: ({ name, state }) =>
+      serialized(async () => {
+        const presets = (await readPresets()).filter((preset) => preset.name !== name);
+        presets.push({ name, state: trimState(state), savedAt: Date.now() });
+        const kept = presets.slice(-MAX_PRESETS);
+        await kv.set(PRESETS_KEY, kept);
+        return kept;
+      }),
+    presetDelete: ({ name }) =>
+      serialized(async () => {
+        const kept = (await readPresets()).filter((preset) => preset.name !== name);
+        await kv.set(PRESETS_KEY, kept);
+        return kept;
+      }),
   });
 
   // Live updates: coalesce thread changes and tell open graphs to refetch.
@@ -811,6 +1072,17 @@ export default async function plugin(bb: BbPluginApi) {
       }, 600);
     },
   });
+  // Ask Labels Pro to tell us about label changes, so the graph and its
+  // label filter refresh when labels are assigned. Without it, labels still
+  // refresh on the next thread change or the 15-second heartbeat.
+  bb.sdk.plugins
+    .callRpc({
+      pluginId: LABELS_PLUGIN_ID,
+      method: "subscribeChanges",
+      input: { method: "labelsChanged" },
+      outputSchema: z.unknown(),
+    })
+    .catch(() => {});
   bb.onDispose(() => {
     unsubscribe();
     if (flushTimer !== null) clearTimeout(flushTimer);
@@ -820,7 +1092,11 @@ export default async function plugin(bb: BbPluginApi) {
   // agents can see what their siblings and subagents are doing.
   const usage = [
     "Usage:",
-    "  bb agent-graph [--thread <id>] [--json]",
+    "  bb agent-graph [--thread <id>] [--hide <facet>=<value>]... [--json]",
+    "",
+    "--hide hides overview threads. Facets: project, label, kind, status,",
+    "provider. Kinds: automation, task, child, manual. Example:",
+    "  bb agent-graph --hide kind=automation --hide status=idle",
     "",
     "Prints the live agent graph: projects, threads, turns, tool calls,",
     "subagents and workflow agents, with their status.",
@@ -853,8 +1129,20 @@ export default async function plugin(bb: BbPluginApi) {
       if (threadFlag >= 0 && threadId === null) {
         return { exitCode: 1, stderr: usage };
       }
+      // `--hide kind=automation` (repeatable) hides overview threads, as
+      // the Filter menu does.
+      const filter: ThreadFilter = {};
+      argv.forEach((arg, index) => {
+        if (arg !== "--hide") return;
+        const [key, ...rest] = (argv[index + 1] ?? "").split("=");
+        const value = rest.join("=");
+        if ((FACET_KEYS as readonly string[]).includes(key ?? "") && value) {
+          const facet = key as (typeof FACET_KEYS)[number];
+          (filter[facet] ??= []).push(value);
+        }
+      });
       const graph =
-        threadId === null ? await buildOverview() : await buildThread(threadId);
+        threadId === null ? await buildOverview(filter) : await buildThread(threadId);
       if (argv.includes("--json")) {
         const text = JSON.stringify(graph);
         if (text.length > 900_000) {
