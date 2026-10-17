@@ -4,7 +4,7 @@
 // thread) with a right-panel "Thread" tab to chat beside the graph, and a
 // thread side-panel tab (this thread or all threads) opened from a
 // thread-header button.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   definePluginApp,
   experimental_useAppPanel,
@@ -18,6 +18,8 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { Graph, rpcContract } from "./server";
 import { AgentGraphView } from "./graph";
+import { useSavedView, type SavedView } from "./saved-view";
+import { normalizeFilter, type ThreadFilter } from "./filters";
 import {
   GRAPH_CHANGED,
   readStorage,
@@ -45,23 +47,33 @@ const THREAD_TAB: ExperimentalPluginFixedTabReference<BesideTarget> = {
   },
 };
 
-/** The graph for one thread (or the overview), refetched on live changes. */
-function useGraph(threadId: string | null) {
+/**
+ * The graph for one thread (or the overview), refetched on live changes.
+ * `filter` hides overview threads; a new filter keeps the old graph on
+ * screen until the new one arrives.
+ */
+function useGraph(threadId: string | null, filter: ThreadFilter = {}) {
   const rpc = useRpc<typeof rpcContract>();
   const [graph, setGraph] = useState<Graph | null>(null);
   const [error, setError] = useState<string | null>(null);
   const graphRef = useRef<Graph | null>(null);
   const refetchRef = useRef<() => void>(() => {});
+  const filterKey = JSON.stringify(normalizeFilter(filter));
+  const shownThreadRef = useRef<string | null | undefined>(undefined);
 
   useEffect(() => {
-    // Everything below belongs to this threadId; a scope change starts
-    // fresh, and late responses from the old scope are ignored.
+    // Everything below belongs to this threadId and filter; a scope change
+    // starts fresh, and late responses from the old scope are ignored.
     let cancelled = false;
     let inFlight = false;
     let again = false;
-    graphRef.current = null;
-    setGraph(null);
+    if (shownThreadRef.current !== threadId) {
+      shownThreadRef.current = threadId;
+      graphRef.current = null;
+      setGraph(null);
+    }
     setError(null);
+    const currentFilter = JSON.parse(filterKey) as ThreadFilter;
 
     const refetch = () => {
       // One request at a time; a change during a fetch schedules one more.
@@ -71,7 +83,7 @@ function useGraph(threadId: string | null) {
       }
       inFlight = true;
       rpc
-        .call("graph", { threadId })
+        .call("graph", threadId === null ? { threadId, filter: currentFilter } : { threadId })
         .then(
           (result) => {
             if (cancelled) return;
@@ -109,7 +121,7 @@ function useGraph(threadId: string | null) {
       clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [rpc, threadId]);
+  }, [rpc, threadId, filterKey]);
 
   useRealtime(GRAPH_CHANGED, (payload: unknown) => {
     if (document.hidden) return;
@@ -126,14 +138,34 @@ function useGraph(threadId: string | null) {
   return { graph, error, retry: () => refetchRef.current() };
 }
 
+/** The graph view before its saved state is known. */
+function LoadingGraph({ toolbarExtra = null, compact = false }: { toolbarExtra?: ReactNode; compact?: boolean }) {
+  return (
+    <div className="flex h-full min-h-0 flex-1">
+      <AgentGraphView graph={null} error={null} onOpenThread={null} compact={compact} toolbarExtra={toolbarExtra} />
+    </div>
+  );
+}
+
 function OverviewPage() {
-  const { graph, error, retry } = useGraph(null);
+  const saved = useSavedView("overview");
+  // The view reads its saved state, filter included, on mount; mount it
+  // once that is known so the first fetch already uses the saved filter.
+  return saved.ready ? <OverviewGraph saved={saved} /> : <LoadingGraph />;
+}
+
+function OverviewGraph({ saved }: { saved: SavedView }) {
+  const [filter, setFilter] = useState<ThreadFilter>(() => saved.initial?.filter ?? {});
+  const { graph, error, retry } = useGraph(null, filter);
   const navigate = useBbNavigate();
   const panel = experimental_useAppPanel();
   return (
     <div className="flex h-full min-h-0 flex-1">
       <AgentGraphView
         graph={graph}
+        saved={saved}
+        filter={filter}
+        onFilterChange={setFilter}
         error={error}
         onRetry={retry}
         onOpenThread={(threadId) => navigate.toThread(threadId)}
@@ -262,26 +294,61 @@ function ThreadGraphPanel({ threadId, params }: { threadId: string; params: unkn
     (params as { scope?: Scope } | null)?.scope ??
     (readStorage(SCOPE_KEY) === "all" ? "all" : "thread");
   const [scope, setScope] = useState<Scope>(initial);
-  const { graph, error, retry } = useGraph(scope === "all" ? null : threadId);
+  // Each thread remembers its own view; a thread opened for the first time
+  // starts with the settings the last thread panel was left in.
+  const saved = useSavedView(
+    scope === "all" ? "panel:all" : `thread:${threadId}`,
+    scope === "all" ? null : "thread:last",
+  );
+  const toolbarExtra = (
+    <ScopeToggle
+      scope={scope}
+      onChange={(next) => {
+        writeStorage(SCOPE_KEY, next);
+        setScope(next);
+      }}
+    />
+  );
+  if (!saved.ready) return <LoadingGraph toolbarExtra={toolbarExtra} compact />;
+  return (
+    <PanelGraph
+      // Remount per scope so each view reads its own saved state and fits
+      // itself on first load.
+      key={scope}
+      scope={scope}
+      threadId={threadId}
+      saved={saved}
+      toolbarExtra={toolbarExtra}
+    />
+  );
+}
+
+function PanelGraph({
+  scope,
+  threadId,
+  saved,
+  toolbarExtra,
+}: {
+  scope: Scope;
+  threadId: string;
+  saved: SavedView;
+  toolbarExtra: ReactNode;
+}) {
+  // Only "All threads" can be filtered; one thread's graph has nothing to hide.
+  const [filter, setFilter] = useState<ThreadFilter>(() => saved.initial?.filter ?? {});
+  const { graph, error, retry } = useGraph(scope === "all" ? null : threadId, filter);
   const navigate = useBbNavigate();
   return (
     <div className="flex h-full min-h-0 flex-1">
       <AgentGraphView
-        // Remount per scope so each view fits itself on first load.
-        key={scope}
         graph={graph}
+        saved={saved}
+        filter={scope === "all" ? filter : null}
+        onFilterChange={scope === "all" ? setFilter : null}
         error={error}
         onRetry={retry}
         compact
-        toolbarExtra={
-          <ScopeToggle
-            scope={scope}
-            onChange={(next) => {
-              writeStorage(SCOPE_KEY, next);
-              setScope(next);
-            }}
-          />
-        }
+        toolbarExtra={toolbarExtra}
         onOpenThread={(id) => {
           if (id !== threadId) navigate.toThread(id);
         }}

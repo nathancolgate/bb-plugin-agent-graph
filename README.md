@@ -90,6 +90,7 @@ graph remembers your choice.
 bb agent-graph                  # every recently active thread
 bb agent-graph --thread <id>    # one thread, its turns, subagents and child threads
 bb agent-graph --json           # machine-readable output
+bb agent-graph --hide kind=automation --hide status=idle   # hide threads, as Filter does
 ```
 
 This prints the same graph as a text tree, so agents can check what their
@@ -109,6 +110,50 @@ sibling agents are doing.
 | Jump to running work | `J`, or the **Running** button (click again to cycle) |
 | Hide finished work | **Active only** |
 | Close details | `Esc` |
+| Save or load a preset | **Presets** in the toolbar |
+
+### Filtering threads
+
+**Filter** in the toolbar shows or hides threads on the **Agent Graph** page
+and in **All threads**. You can filter on:
+
+| Group | Values |
+| --- | --- |
+| Projects | Each bb project with a thread in the window |
+| Labels | Each [Labels Pro](https://github.com/kr3t3n/bb-plugin-labels-pro) label, plus "No label" |
+| Thread type | Automations, task threads (title starts with a task key, such as `JOBS-12`), subthreads, other threads |
+| Status | Running, needs input, queued, error, idle |
+| Provider | Each agent provider, such as `claude-code` or `codex` |
+
+Clear a value to hide its threads. **Only** hides the other values in that
+group. A thread with several labels is hidden when any one of them is
+hidden. New projects and labels are shown until you hide them.
+
+The filter runs before **Max threads in overview**, so hidden threads make
+room for others. The legend shows how many threads the filter hides. The
+Labels group appears only when Labels Pro is installed.
+
+### Saved views and presets
+
+The graph opens the way you left it. Each view remembers the open and closed
+nodes, **Active only**, the color mode, the filter, and the pan and zoom:
+
+- The **Agent Graph** page has one saved view.
+- Each thread's side panel has its own saved view. A thread you open for the
+  first time starts with the settings of the last thread panel you used.
+- **All threads** in the side panel has its own saved view.
+
+**Expand** and **Collapse** also apply to work that arrives later, so a graph
+left fully expanded stays expanded. If you leave the view fitted (**Fit** or
+`0`), it fits itself again on the next open. If you pan or zoom, it opens at
+that spot.
+
+**Presets** keep named copies of the settings, the filter and the open nodes. Type a name
+and click **Save** to save the current view. Click a preset to load it into
+any view. **Reset to default view** goes back to the default collapse policy.
+
+Saved views and presets are stored by the bb server, so they are the same in
+the desktop app and in a browser.
 
 Finished turns and subagents start collapsed so the graph opens on what's
 happening now. Long runs of tool calls fold into "+N earlier steps".
@@ -131,8 +176,9 @@ Changes apply right away.
 - Agent Graph reads your threads, projects and timelines through the bb plugin
   SDK. It never sends them anywhere else and makes no outside network requests.
 - It has no secrets or API keys.
-- It stores only a few view preferences (color mode, graph scope, the thread
-  you last chatted with) in your browser's local storage.
+- It stores a few view preferences (color mode, graph scope, the thread you
+  last chatted with) in your browser's local storage. Saved views and presets
+  are stored in the plugin's own storage on your bb server.
 - Chatting beside the graph uses bb's own chat component, with the thread's
   normal permission settings.
 
@@ -171,6 +217,8 @@ Code map:
 | `server.ts` | Builds the graph from bb thread timelines, pushes live updates, and adds the `bb agent-graph` command |
 | `timeline.ts` | Groups timeline rows into turns |
 | `layout.ts` | Lays out the tree and folds long runs of tool calls |
+| `filters.ts` | Thread filter rules: facets, thread types, hide checks |
+| `saved-view.ts` | Loads and saves views and presets through the server |
 | `graph.tsx` | The graph view: cards, edges, pan and zoom, details panel |
 | `app.tsx` | Registers the sidebar page, side panels and header button |
 | `shared.ts` | Constants and helpers used by both the backend and the frontend |

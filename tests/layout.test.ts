@@ -71,3 +71,38 @@ test("active-only keeps running work and its ancestors", () => {
   ]);
   assert.deepEqual(kept.map((n) => n.id), ["root", "busy", "tool"]);
 });
+
+test("an expanded baseline opens finished work and unfolds long runs", () => {
+  const nodes = [
+    node("thread", null, { kind: "thread" }),
+    node("t1", "thread", { kind: "turn" }),
+    node("t1-tool", "t1"),
+    node("t2", "thread", { kind: "turn" }),
+    ...Array.from({ length: FOLD_AFTER + 3 }, (_, i) => node(`tool${String(i)}`, "t2")),
+  ];
+  const byDefault = layoutGraph(nodes, new Map());
+  assert.equal(byDefault.nodes.find((item) => item.node.id === "t1")!.collapsed, true);
+  assert.ok(byDefault.nodes.some((item) => item.node.id === "t2" + FOLD_SUFFIX));
+
+  const expanded = layoutGraph(nodes, new Map(), "expanded");
+  assert.equal(expanded.nodes.find((item) => item.node.id === "t1")!.collapsed, false);
+  assert.ok(!expanded.nodes.some((item) => item.node.kind === "more"));
+  assert.equal(expanded.nodes.length, nodes.length);
+});
+
+test("a collapsed baseline closes every parent, and per-node choices win", () => {
+  const nodes = [
+    node("thread", null, { kind: "thread" }),
+    node("t1", "thread", { kind: "turn", status: "running" }),
+    node("t1-tool", "t1", { status: "running" }),
+  ];
+  const collapsed = layoutGraph(nodes, new Map(), "collapsed");
+  assert.deepEqual(collapsed.nodes.map((item) => item.node.id), ["thread"]);
+  assert.equal(collapsed.nodes[0]!.hidden.running, 2);
+
+  const opened = layoutGraph(nodes, new Map([["thread", false]]), "collapsed");
+  assert.deepEqual(
+    opened.nodes.map((item) => [item.node.id, item.collapsed]),
+    [["thread", false], ["t1", true]],
+  );
+});

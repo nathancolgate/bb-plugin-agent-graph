@@ -1,6 +1,7 @@
 // Pure tree layout for the agent graph: left-to-right tidy tree, parents
 // centered on their visible children. No React, so it is easy to test.
 import type { GraphNode, NodeStatus } from "./server";
+import type { Baseline } from "./shared";
 
 export const NODE_WIDTH = 240;
 export const NODE_HEIGHT = 58;
@@ -83,8 +84,9 @@ function foldKids(
   parent: GraphNode,
   kids: GraphNode[],
   overrides: ReadonlyMap<string, boolean>,
+  baseline: Baseline,
 ): GraphNode[] {
-  if (overrides.get(parent.id + UNFOLD_SUFFIX)) return kids;
+  if (overrides.get(parent.id + UNFOLD_SUFFIX) ?? baseline === "expanded") return kids;
   const tools = kids.filter((kid) => kid.kind === "tool");
   const excess = tools.length - FOLD_AFTER;
   if (excess <= 1) return kids;
@@ -112,9 +114,15 @@ function foldKids(
   return result;
 }
 
+/**
+ * `baseline` decides nodes the user has not toggled one by one: the default
+ * policy, or everything open or closed. New nodes follow it too, so a graph
+ * left fully expanded stays fully expanded as agents add work.
+ */
 export function layoutGraph(
   nodes: GraphNode[],
   overrides: ReadonlyMap<string, boolean>,
+  baseline: Baseline = "default",
 ): Layout {
   const index = childrenIndex(nodes);
   const laid: LaidOutNode[] = [];
@@ -134,9 +142,12 @@ export function layoutGraph(
 
   const place = (node: GraphNode, depth: number, siblings: GraphNode[]): LaidOutNode => {
     maxDepth = Math.max(maxDepth, depth);
-    const kids = foldKids(node, index.get(node.id) ?? [], overrides);
+    const kids = foldKids(node, index.get(node.id) ?? [], overrides, baseline);
     const collapsed =
-      overrides.get(node.id) ?? defaultCollapsed(node, siblings, kids.length);
+      overrides.get(node.id) ??
+      (baseline === "default"
+        ? defaultCollapsed(node, siblings, kids.length)
+        : baseline === "collapsed" && kids.length > 0);
     const entry: LaidOutNode = {
       node,
       x: depth * (NODE_WIDTH + COLUMN_GAP),

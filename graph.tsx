@@ -16,7 +16,6 @@ import type {
 } from "react";
 import type { Graph, GraphNode, NodeKind, NodeStatus } from "./server";
 import {
-  childrenIndex,
   filterActive,
   isActive,
   layoutGraph,
@@ -26,7 +25,24 @@ import {
   UNFOLD_SUFFIX,
   type LaidOutNode,
 } from "./layout";
-import { readStorage, writeStorage } from "./shared";
+import {
+  readStorage,
+  writeStorage,
+  type Baseline,
+  type ColorMode,
+  type Preset,
+  type ViewState,
+  type Viewport,
+} from "./shared";
+import type { SavedView } from "./saved-view";
+import {
+  FACET_KEYS,
+  FACET_LABEL,
+  hiddenCount,
+  type FacetKey,
+  type Facets,
+  type ThreadFilter,
+} from "./filters";
 import { Button } from "@/components/ui/button";
 import { Icon, type IconName } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
@@ -143,7 +159,7 @@ function categoryColor(category: Category): string {
   return `var(--ag-t-${category})`;
 }
 
-export type ColorMode = "type" | "status";
+export type { ColorMode };
 const COLOR_MODE_KEY = "agent-graph:color-mode";
 
 function statusColor(status: NodeStatus): string {
@@ -518,10 +534,293 @@ function DetailPanel({
   );
 }
 
-interface Viewport {
-  x: number;
-  y: number;
-  scale: number;
+/** Close a toolbar popover on a click outside it. */
+function useDismiss(open: boolean, close: () => void) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (event: PointerEvent) => {
+      if (!ref.current?.contains(event.target as Node)) close();
+    };
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  }, [open, close]);
+  return ref;
+}
+
+/**
+ * Show or hide overview threads by project, label, thread type, status and
+ * provider. A checked value is shown; "Only" hides the rest of its group.
+ */
+function FilterMenu({
+  facets,
+  filter,
+  filteredOut,
+  onChange,
+}: {
+  facets: Facets;
+  filter: ThreadFilter;
+  filteredOut: number;
+  onChange: (filter: ThreadFilter) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const close = useCallback(() => setOpen(false), []);
+  const rootRef = useDismiss(open, close);
+  const hidden = hiddenCount(filter);
+  const needle = query.trim().toLowerCase();
+  const setHidden = (key: FacetKey, values: string[]) => {
+    const next = { ...filter };
+    if (values.length > 0) next[key] = values;
+    else delete next[key];
+    onChange(next);
+  };
+  const toggle = (key: FacetKey, value: string) => {
+    const current = filter[key] ?? [];
+    setHidden(
+      key,
+      current.includes(value) ? current.filter((item) => item !== value) : [...current, value],
+    );
+  };
+  return (
+    <div
+      ref={rootRef}
+      className="relative"
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && open) {
+          setOpen(false);
+          event.stopPropagation();
+        }
+      }}
+    >
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-7 gap-1 px-2"
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        aria-pressed={hidden > 0}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <Icon name="SlidersHorizontal" className="size-3.5" />
+        Filter
+        {hidden > 0 ? (
+          <span className="rounded bg-primary/15 px-1 text-xs tabular-nums text-primary">{hidden}</span>
+        ) : null}
+      </Button>
+      {open ? (
+        <div
+          role="dialog"
+          aria-label="Filter threads"
+          className="absolute left-0 top-full z-30 mt-2 flex max-h-[min(70vh,36rem)] w-72 flex-col rounded-lg border border-border bg-background text-sm shadow-lg"
+        >
+          <div className="border-b border-border p-2">
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Find a project, label…"
+              aria-label="Find a filter value"
+              className="h-7 w-full rounded-md border border-border bg-background px-2 text-sm outline-none focus:border-primary"
+            />
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto p-2">
+            {FACET_KEYS.map((key) => {
+              const values = facets[key].filter(
+                (item) => !needle || item.label.toLowerCase().includes(needle),
+              );
+              if (values.length === 0) return null;
+              const hiddenHere = filter[key] ?? [];
+              return (
+                <section key={key} className="mb-2 last:mb-0" aria-label={FACET_LABEL[key]}>
+                  <div className="flex items-center justify-between px-1 py-1">
+                    <span className="text-xs font-medium text-muted-foreground">{FACET_LABEL[key]}</span>
+                    {hiddenHere.length > 0 ? (
+                      <button
+                        type="button"
+                        className="text-xs text-primary hover:underline"
+                        onClick={() => setHidden(key, [])}
+                      >
+                        Show all
+                      </button>
+                    ) : null}
+                  </div>
+                  <ul>
+                    {values.map((item) => {
+                      const shown = !hiddenHere.includes(item.value);
+                      return (
+                        <li key={item.value} className="group flex items-center gap-1 rounded hover:bg-state-hover">
+                          <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 px-1 py-1">
+                            <input
+                              type="checkbox"
+                              checked={shown}
+                              onChange={() => toggle(key, item.value)}
+                              className="size-3.5 shrink-0 accent-[var(--primary)]"
+                            />
+                            {item.color ? (
+                              <span
+                                aria-hidden
+                                className="inline-block size-2 shrink-0 rounded-full"
+                                style={{ background: item.color }}
+                              />
+                            ) : null}
+                            <span className={cn("min-w-0 flex-1 truncate", !shown && "text-muted-foreground line-through")}>
+                              {item.label}
+                            </span>
+                            <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{item.count}</span>
+                          </label>
+                          <button
+                            type="button"
+                            className="shrink-0 rounded px-1.5 py-0.5 text-xs text-muted-foreground opacity-0 hover:text-foreground focus:opacity-100 group-hover:opacity-100"
+                            aria-label={`Show only ${item.label}`}
+                            onClick={() =>
+                              setHidden(
+                                key,
+                                facets[key].map((other) => other.value).filter((value) => value !== item.value),
+                              )
+                            }
+                          >
+                            Only
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </section>
+              );
+            })}
+          </div>
+          <div className="flex items-center justify-between gap-2 border-t border-border p-2">
+            <span className="text-xs text-muted-foreground">
+              {filteredOut > 0 ? `${filteredOut} thread${filteredOut === 1 ? "" : "s"} hidden` : "Nothing hidden"}
+            </span>
+            <Button variant="outline" size="sm" className="h-7 px-2" disabled={hidden === 0} onClick={() => onChange({})}>
+              Show everything
+            </Button>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** Load, save and delete named presets of the toolbar settings and open nodes. */
+function PresetsMenu({
+  presets,
+  onLoad,
+  onSave,
+  onDelete,
+  onReset,
+}: {
+  presets: Preset[];
+  onLoad: (preset: Preset) => void;
+  onSave: (name: string) => void;
+  onDelete: (name: string) => void;
+  onReset: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const close = useCallback(() => setOpen(false), []);
+  const rootRef = useDismiss(open, close);
+  const trimmed = name.trim();
+  const save = () => {
+    if (!trimmed) return;
+    onSave(trimmed);
+    setName("");
+  };
+  return (
+    <div
+      ref={rootRef}
+      className="relative"
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && open) {
+          setOpen(false);
+          event.stopPropagation();
+        }
+      }}
+    >
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-7 gap-1 px-2"
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        onClick={() => setOpen((value) => !value)}
+      >
+        <Icon name="Layers" className="size-3.5" />
+        Presets
+      </Button>
+      {open ? (
+        <div
+          role="dialog"
+          aria-label="Graph presets"
+          className="absolute left-0 top-full z-30 mt-2 w-64 rounded-lg border border-border bg-background p-2 text-sm shadow-lg"
+        >
+          {presets.length === 0 ? (
+            <p className="px-1 py-1 text-xs text-muted-foreground">
+              No presets yet. A preset keeps the toolbar settings, the filter and which nodes are open.
+            </p>
+          ) : (
+            <ul className="max-h-60 overflow-y-auto">
+              {[...presets].reverse().map((preset) => (
+                <li key={preset.name} className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 truncate rounded px-2 py-1 text-left hover:bg-state-hover"
+                    onClick={() => {
+                      onLoad(preset);
+                      setOpen(false);
+                    }}
+                  >
+                    {preset.name}
+                  </button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 w-6 shrink-0 px-0 text-muted-foreground"
+                    aria-label={`Delete preset ${preset.name}`}
+                    onClick={() => onDelete(preset.name)}
+                  >
+                    <Icon name="X" className="size-3.5" />
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <form
+            className="mt-2 flex items-center gap-1 border-t border-border pt-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              save();
+            }}
+          >
+            <input
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              maxLength={60}
+              placeholder="Save current as…"
+              aria-label="Preset name"
+              className="h-7 min-w-0 flex-1 rounded-md border border-border bg-background px-2 text-sm outline-none focus:border-primary"
+            />
+            <Button type="submit" variant="outline" size="sm" className="h-7 px-2" disabled={!trimmed}>
+              Save
+            </Button>
+          </form>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="mt-1 h-7 w-full justify-start gap-1.5 px-2 text-muted-foreground"
+            onClick={() => {
+              onReset();
+              setOpen(false);
+            }}
+          >
+            <Icon name="RotateCcw" className="size-3.5" />
+            Reset to default view
+          </Button>
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 export function AgentGraphView({
@@ -532,6 +831,9 @@ export function AgentGraphView({
   compact = false,
   toolbarExtra = null,
   onRetry = null,
+  saved = null,
+  filter = null,
+  onFilterChange = null,
 }: {
   graph: Graph | null;
   error: string | null;
@@ -543,18 +845,33 @@ export function AgentGraphView({
   compact?: boolean;
   /** Extra controls rendered first in the toolbar row. */
   toolbarExtra?: ReactNode;
+  /**
+   * Where this view's state is remembered. Read once on mount: render the
+   * view after `saved.ready`, or key it on that.
+   */
+  saved?: SavedView | null;
+  /** The overview's thread filter; null where the graph cannot be filtered. */
+  filter?: ThreadFilter | null;
+  onFilterChange?: ((filter: ThreadFilter) => void) | null;
 }) {
-  const [overrides, setOverrides] = useState<Map<string, boolean>>(() => new Map());
+  const initial = saved?.initial ?? null;
+  const [overrides, setOverrides] = useState<Map<string, boolean>>(
+    () => new Map(Object.entries(initial?.overrides ?? {})),
+  );
+  const [baseline, setBaseline] = useState<Baseline>(initial?.baseline ?? "default");
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [activeOnly, setActiveOnly] = useState(false);
-  const [colorMode, setColorMode] = useState<ColorMode>(() =>
-    readStorage(COLOR_MODE_KEY) === "status" ? "status" : "type",
+  const [activeOnly, setActiveOnly] = useState(initial?.activeOnly ?? false);
+  const [colorMode, setColorMode] = useState<ColorMode>(
+    () => initial?.colorMode ?? (readStorage(COLOR_MODE_KEY) === "status" ? "status" : "type"),
   );
   const changeColorMode = (mode: ColorMode) => {
     setColorMode(mode);
     writeStorage(COLOR_MODE_KEY, mode);
   };
-  const [view, setView] = useState<Viewport>({ x: 24, y: 24, scale: 1 });
+  const [view, setView] = useState<Viewport>(initial?.viewport ?? { x: 24, y: 24, scale: 1 });
+  // A view the user panned or zoomed reopens where they left it; one left
+  // fitted fits itself again, because the graph keeps growing.
+  const [pinned, setPinned] = useState(initial?.viewport != null);
   const containerRef = useRef<HTMLDivElement>(null);
   const fittedRef = useRef(false);
   const dragRef = useRef<{ x: number; y: number; vx: number; vy: number } | null>(null);
@@ -576,7 +893,10 @@ export function AgentGraphView({
     if (!graph) return [];
     return activeOnly ? filterActive(graph.nodes) : graph.nodes;
   }, [graph, activeOnly]);
-  const layout = useMemo(() => layoutGraph(nodes, overrides), [nodes, overrides]);
+  const layout = useMemo(
+    () => layoutGraph(nodes, overrides, baseline),
+    [nodes, overrides, baseline],
+  );
   const selected = layout.nodes.find((item) => item.node.id === selectedId) ?? null;
 
   const counts = useMemo(() => {
@@ -615,6 +935,7 @@ export function AgentGraphView({
       layout.nodes[layout.nodes.length - 1]!;
     const fitsX = layout.width * scale <= el.clientWidth - pad * 2;
     const fitsY = layout.height * scale <= el.clientHeight - top - pad;
+    setPinned(false);
     setView({
       scale,
       x: fitsX
@@ -626,15 +947,91 @@ export function AgentGraphView({
     });
   }, [layout, compact]);
 
-  // Fit once when the first graph arrives; later refreshes keep the user's view.
+  // Fit once when the first graph arrives; later refreshes keep the user's
+  // view. A restored view is kept unless none of the graph is on screen.
   useLayoutEffect(() => {
     if (!fittedRef.current && layout.nodes.length > 0) {
       fittedRef.current = true;
-      fit();
+      const el = containerRef.current;
+      const onScreen =
+        el !== null &&
+        layout.nodes.some((item) => {
+          const left = view.x + item.x * view.scale;
+          const top = view.y + item.y * view.scale;
+          return (
+            left < el.clientWidth &&
+            left + NODE_WIDTH * view.scale > 0 &&
+            top < el.clientHeight &&
+            top + NODE_HEIGHT * view.scale > 0
+          );
+        });
+      if (!pinned || !onScreen) fit();
     }
-  }, [fit, layout.nodes.length]);
+  }, [fit, layout.nodes, view, pinned]);
+
+  // Loading a preset or resetting re-fits once the new layout is in.
+  const [refit, setRefit] = useState(0);
+  useLayoutEffect(() => {
+    // Only a new request re-fits, not every layout change.
+    if (refit > 0) fit();
+  }, [refit]);
+
+  // Remember the view: debounced while it changes, flushed when it closes.
+  const viewState = useMemo<ViewState>(
+    () => ({
+      baseline,
+      overrides: Object.fromEntries(overrides),
+      activeOnly,
+      colorMode,
+      ...(filter ? { filter } : {}),
+      viewport: pinned ? view : null,
+    }),
+    [baseline, overrides, activeOnly, colorMode, filter, pinned, view],
+  );
+  const saveRef = useRef(saved?.save ?? null);
+  saveRef.current = saved?.save ?? null;
+  const pendingRef = useRef<ViewState | null>(null);
+  const flush = useCallback(() => {
+    const state = pendingRef.current;
+    pendingRef.current = null;
+    if (state && saveRef.current) saveRef.current(state);
+  }, []);
+  const firstStateRef = useRef(true);
+  useEffect(() => {
+    if (firstStateRef.current) {
+      firstStateRef.current = false;
+      return;
+    }
+    pendingRef.current = viewState;
+    const timer = setTimeout(flush, 600);
+    return () => clearTimeout(timer);
+  }, [viewState, flush]);
+  useEffect(() => {
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      flush();
+    };
+  }, [flush]);
+
+  const applyState = (state: ViewState) => {
+    setBaseline(state.baseline);
+    setOverrides(new Map(Object.entries(state.overrides)));
+    setActiveOnly(state.activeOnly);
+    changeColorMode(state.colorMode);
+    onFilterChange?.(state.filter ?? {});
+    setRefit((value) => value + 1);
+  };
+  const resetView = () => {
+    setBaseline("default");
+    setOverrides(new Map());
+    setActiveOnly(false);
+    onFilterChange?.({});
+    setRefit((value) => value + 1);
+  };
 
   const zoomAt = useCallback((factor: number, cx: number, cy: number) => {
+    setPinned(true);
     setView((current) => {
       const scale = Math.min(2.5, Math.max(0.2, current.scale * factor));
       const ratio = scale / current.scale;
@@ -653,6 +1050,7 @@ export function AgentGraphView({
         const rect = el.getBoundingClientRect();
         zoomAt(Math.exp(-event.deltaY * 0.01), event.clientX - rect.left, event.clientY - rect.top);
       } else {
+        setPinned(true);
         setView((current) => ({ ...current, x: current.x - event.deltaX, y: current.y - event.deltaY }));
       }
     };
@@ -669,7 +1067,10 @@ export function AgentGraphView({
   const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
     if (!drag) return;
-    if (Math.abs(event.clientX - drag.x) + Math.abs(event.clientY - drag.y) > 3) movedRef.current = true;
+    if (Math.abs(event.clientX - drag.x) + Math.abs(event.clientY - drag.y) > 3) {
+      movedRef.current = true;
+      setPinned(true);
+    }
     setView((current) => ({
       ...current,
       x: drag.vx + event.clientX - drag.x,
@@ -680,21 +1081,20 @@ export function AgentGraphView({
     dragRef.current = null;
   };
 
-  const toggle = (item: LaidOutNode) => {
-    setOverrides((current) => new Map(current).set(item.node.id, !item.collapsed));
+  // Re-insert on change, so the saved list keeps the newest choices last.
+  const setOverride = (id: string, value: boolean) => {
+    setOverrides((current) => {
+      const next = new Map(current);
+      next.delete(id);
+      return next.set(id, value);
+    });
   };
-  // Walk the full tree, not just what is laid out: collapsed subtrees hide
-  // their descendants from the layout.
+  const toggle = (item: LaidOutNode) => setOverride(item.node.id, !item.collapsed);
+  // A baseline rather than one choice per node, so work that arrives later
+  // opens (or stays closed) the same way.
   const expandAll = (expand: boolean) => {
-    const index = childrenIndex(nodes);
-    const next = new Map<string, boolean>();
-    for (const node of nodes) {
-      if ((index.get(node.id)?.length ?? 0) > 0) {
-        next.set(node.id, !expand);
-        if (expand) next.set(node.id + UNFOLD_SUFFIX, true);
-      }
-    }
-    setOverrides(next);
+    setBaseline(expand ? "expanded" : "collapsed");
+    setOverrides(new Map());
   };
 
   const running = layout.nodes.filter((item) => item.node.status === "running" && item.childCount === 0);
@@ -711,6 +1111,7 @@ export function AgentGraphView({
     }
     const target = [...running].reverse()[jumpIndexRef.current % running.length]!;
     jumpIndexRef.current += 1;
+    setPinned(true);
     setView((current) => {
       const scale = Math.max(current.scale, 0.8);
       return {
@@ -780,6 +1181,23 @@ export function AgentGraphView({
             <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => expandAll(false)}>
               Collapse
             </Button>
+            {onFilterChange && filter && graph?.facets ? (
+              <FilterMenu
+                facets={graph.facets}
+                filter={filter}
+                filteredOut={graph.filteredOut}
+                onChange={onFilterChange}
+              />
+            ) : null}
+            {saved ? (
+              <PresetsMenu
+                presets={saved.presets}
+                onLoad={(preset) => applyState(preset.state)}
+                onSave={(name) => saved.savePreset(name, { ...viewState, viewport: null })}
+                onDelete={saved.deletePreset}
+                onReset={resetView}
+              />
+            ) : null}
           </div>
         </div>
         <div className="absolute bottom-3 right-3 z-10 flex items-center gap-2">
@@ -847,6 +1265,11 @@ export function AgentGraphView({
               </span>
             ))}
             {graph?.truncated ? <span className="text-muted-foreground">· truncated</span> : null}
+            {graph && graph.filteredOut > 0 ? (
+              <span className="text-muted-foreground">
+                · {graph.filteredOut} thread{graph.filteredOut === 1 ? "" : "s"} hidden by the filter
+              </span>
+            ) : null}
             <span className="basis-full text-muted-foreground">
               Click a node for details · double-click to open its chat · drag or scroll to pan · ⌘/ctrl+scroll to zoom · J jumps to running work
             </span>
@@ -896,8 +1319,7 @@ export function AgentGraphView({
                 selected={item.node.id === selectedId}
                 onSelect={() => {
                   if (item.node.id.endsWith(FOLD_SUFFIX) && item.node.parentId) {
-                    const unfold = item.node.parentId + UNFOLD_SUFFIX;
-                    setOverrides((current) => new Map(current).set(unfold, true));
+                    setOverride(item.node.parentId + UNFOLD_SUFFIX, true);
                   } else {
                     setSelectedId(item.node.id);
                   }
