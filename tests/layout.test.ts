@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { GraphNode } from "../server.ts";
+import type { GraphNode } from "../contract.ts";
 import {
   defaultCollapsed,
   filterActive,

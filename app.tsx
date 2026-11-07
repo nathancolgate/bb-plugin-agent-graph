@@ -4,38 +4,33 @@
 // thread) with a right-panel "Thread" tab to chat beside the graph, and a
 // thread side-panel tab (this thread or all threads) opened from a
 // thread-header button.
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import {
   definePluginApp,
   experimental_useAppPanel,
   experimental_useFixedTabTarget,
+  experimental_useRpcQuery,
   experimental_useSidebarThreads,
+  experimental_useTabVisible,
   ThreadChat,
   useBbNavigate,
-  useRealtime,
-  useRpc,
-  type ExperimentalPluginFixedTabReference,
+  type ExperimentalTabReference,
+  type ExperimentalTabTargetReference,
 } from "@get-bb/plugin-sdk/app";
-import type { Graph, rpcContract } from "./server";
+import { rpcContract } from "./contract";
 import { AgentGraphView } from "./graph";
-import {
-  GRAPH_CHANGED,
-  readStorage,
-  writeStorage,
-  type GraphChangedPayload,
-} from "./shared";
+import { readStorage, writeStorage } from "./shared";
 import { Button } from "@/components/ui/button";
-import { Icon } from "@/components/ui/icon";
 
-const PANEL_ACTION_ID = "thread-graph";
 const SCOPE_KEY = "agent-graph:panel-scope";
 const BESIDE_KEY = "agent-graph:beside-thread";
 
 type BesideTarget = { threadId: string };
 /** The graph page's right-panel tab that hosts a thread's chat. */
-const THREAD_TAB: ExperimentalPluginFixedTabReference<BesideTarget> = {
-  panelId: "graph",
+const THREAD_TAB: ExperimentalTabTargetReference<BesideTarget> = {
   id: "thread",
+  context: { kind: "nav-panel", panelId: "graph" },
+  availability: "fixed",
   experimental_target: {
     validate: (value): value is BesideTarget =>
       typeof value === "object" &&
@@ -44,86 +39,29 @@ const THREAD_TAB: ExperimentalPluginFixedTabReference<BesideTarget> = {
       typeof (value as { threadId?: unknown }).threadId === "string",
   },
 };
+/** The thread side-panel tab that shows the graph. */
+const GRAPH_TAB: ExperimentalTabReference & { availability: "action" } = {
+  id: "thread-graph",
+  context: { kind: "thread" },
+  availability: "action",
+};
 
-/** The graph for one thread (or the overview), refetched on live changes. */
-function useGraph(threadId: string | null) {
-  const rpc = useRpc<typeof rpcContract>();
-  const [graph, setGraph] = useState<Graph | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const graphRef = useRef<Graph | null>(null);
-  const refetchRef = useRef<() => void>(() => {});
-
-  useEffect(() => {
-    // Everything below belongs to this threadId; a scope change starts
-    // fresh, and late responses from the old scope are ignored.
-    let cancelled = false;
-    let inFlight = false;
-    let again = false;
-    graphRef.current = null;
-    setGraph(null);
-    setError(null);
-
-    const refetch = () => {
-      // One request at a time; a change during a fetch schedules one more.
-      if (inFlight) {
-        again = true;
-        return;
-      }
-      inFlight = true;
-      rpc
-        .call("graph", { threadId })
-        .then(
-          (result) => {
-            if (cancelled) return;
-            graphRef.current = result;
-            setGraph(result);
-            setError(null);
-          },
-          (cause: unknown) => {
-            if (cancelled) return;
-            setError(cause instanceof Error ? cause.message : String(cause));
-          },
-        )
-        .finally(() => {
-          inFlight = false;
-          if (again && !cancelled) {
-            again = false;
-            refetch();
-          }
-        });
-    };
-    refetchRef.current = refetch;
-    refetch();
-
-    // A slow heartbeat keeps durations and missed events honest, but only
-    // while someone can see it.
-    const timer = setInterval(() => {
-      if (!document.hidden) refetch();
-    }, 15_000);
-    const onVisible = () => {
-      if (!document.hidden) refetch();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
-  }, [rpc, threadId]);
-
-  useRealtime(GRAPH_CHANGED, (payload: unknown) => {
-    if (document.hidden) return;
-    const current = graphRef.current;
-    if (threadId !== null && current !== null) {
-      // A single-thread graph only cares about threads it shows.
-      const changed = (payload as Partial<GraphChangedPayload> | null)?.threadIds;
-      const known = new Set(current.nodes.map((node) => node.threadId));
-      if (changed && changed.length > 0 && !changed.some((id) => known.has(id))) return;
-    }
-    refetchRef.current();
+/**
+ * The graph for one thread (or the overview). The server tags each read and
+ * invalidates it when a thread it shows changes, so there is no polling.
+ */
+function useGraph(threadId: string | null, enabled = true) {
+  const query = experimental_useRpcQuery({
+    contract: rpcContract,
+    method: "graph",
+    input: { threadId },
+    enabled,
   });
-
-  return { graph, error, retry: () => refetchRef.current() };
+  return {
+    graph: query.data ?? null,
+    error: query.error?.message ?? null,
+    retry: () => void query.refetch(),
+  };
 }
 
 function OverviewPage() {
@@ -139,11 +77,7 @@ function OverviewPage() {
         onOpenThread={(threadId) => navigate.toThread(threadId)}
         onOpenBeside={(threadId) => {
           writeStorage(BESIDE_KEY, threadId);
-          panel.openFixedTab({
-            surface: { kind: "current" },
-            tab: THREAD_TAB,
-            target: { threadId },
-          });
+          panel.openTab({ tab: THREAD_TAB, target: { threadId } });
         }}
       />
     </div>
@@ -224,7 +158,7 @@ function BesideThreadTab() {
       <ThreadPicker
         onPick={(id) => {
           writeStorage(BESIDE_KEY, id);
-          panel.openFixedTab({ surface: { kind: "current" }, tab: THREAD_TAB, target: { threadId: id } });
+          panel.openTab({ tab: THREAD_TAB, target: { threadId: id } });
         }}
       />
     );
@@ -262,7 +196,12 @@ function ThreadGraphPanel({ threadId, params }: { threadId: string; params: unkn
     (params as { scope?: Scope } | null)?.scope ??
     (readStorage(SCOPE_KEY) === "all" ? "all" : "thread");
   const [scope, setScope] = useState<Scope>(initial);
-  const { graph, error, retry } = useGraph(scope === "all" ? null : threadId);
+  // bb keeps a closed panel's tab mounted; only read while it is on screen.
+  const visible = experimental_useTabVisible();
+  const { graph, error, retry } = useGraph(
+    scope === "all" ? null : threadId,
+    visible,
+  );
   const navigate = useBbNavigate();
   return (
     <div className="flex h-full min-h-0 flex-1">
@@ -290,23 +229,6 @@ function ThreadGraphPanel({ threadId, params }: { threadId: string; params: unkn
   );
 }
 
-function ThreadHeaderButton() {
-  const navigate = useBbNavigate();
-  return (
-    <Button
-      variant="ghost"
-      size="icon"
-      className="size-7"
-      aria-label="Open agent graph"
-      onClick={() => {
-        navigate.openThreadPanel({ actionId: PANEL_ACTION_ID, title: "Agent graph" });
-      }}
-    >
-      <Icon name="Workflow" className="size-4" />
-    </Button>
-  );
-}
-
 export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "graph",
@@ -314,29 +236,40 @@ export default definePluginApp((app) => {
     icon: "Workflow",
     path: "graph",
     component: OverviewPage,
-    fixedTabs: [
-      {
-        ...THREAD_TAB,
-        title: "Thread",
-        icon: "MessageSquare",
-        layout: "flush",
-        component: BesideThreadTab,
-      },
-    ],
   });
-  app.slots.threadPanelAction({
-    id: PANEL_ACTION_ID,
+  app.slots.experimental_tab({
+    ...THREAD_TAB,
+    context: { kind: "nav-panel", panelId: "graph" },
+    availability: "fixed",
+    title: "Thread",
+    icon: "MessageSquare",
+    layout: "flush",
+    component: BesideThreadTab,
+  });
+  app.slots.experimental_tab({
+    ...GRAPH_TAB,
+    context: { kind: "thread" },
+    availability: "action",
     title: "Agent graph",
     icon: "Workflow",
     layout: "flush",
     component: ThreadGraphPanel,
-    run: ({ openPanel }) => {
-      openPanel({ title: "Agent graph" });
+    run: ({ experimental_panel }) => {
+      experimental_panel.openTab({ tab: GRAPH_TAB, title: "Agent graph" });
     },
   });
-  app.slots.experimental_threadHeaderAction({
+  app.slots.experimental_threadAction({
     id: "graph-button",
     title: "Agent graph",
-    component: ThreadHeaderButton,
+    icon: "Workflow",
+    group: "agent-graph",
+    placement: "header",
+    item: ({ experimental_panel }) => ({
+      label: "Agent graph",
+      icon: "Workflow",
+      run: () => {
+        experimental_panel.openTab({ tab: GRAPH_TAB, title: "Agent graph" });
+      },
+    }),
   });
 });
