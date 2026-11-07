@@ -22,7 +22,7 @@ Or from a terminal:
 bb plugin install agent-graph
 ```
 
-Requires bb 0.41 or newer.
+Requires bb 0.49 or newer.
 
 ## How it works
 
@@ -141,8 +141,8 @@ Changes apply right away.
 - **A thread is missing from the overview.** It may be older than the overview
   window, or past the thread limit. Raise either in Settings, or open the
   thread and use its graph button.
-- **The graph looks stale.** It refreshes on every change and every 15 seconds
-  while visible. If a refresh fails, a message with a **Retry** button appears.
+- **The graph looks stale.** It refreshes when a thread it shows changes. If a
+  refresh fails, a message with a **Retry** button appears.
 - **Everything is collapsed.** Click **Expand** in the toolbar, or press `J` to
   jump to running work.
 
@@ -168,7 +168,8 @@ Code map:
 
 | File | What it does |
 | --- | --- |
-| `server.ts` | Builds the graph from bb thread timelines, pushes live updates, and adds the `bb agent-graph` command |
+| `contract.ts` | The graph RPC contract and the tags that refresh it |
+| `server.ts` | Builds the graph from bb thread timelines, refreshes open graphs on changes, and adds the `bb agent-graph` command |
 | `timeline.ts` | Groups timeline rows into turns |
 | `layout.ts` | Lays out the tree and folds long runs of tool calls |
 | `graph.tsx` | The graph view: cards, edges, pan and zoom, details panel |

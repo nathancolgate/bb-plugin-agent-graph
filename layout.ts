@@ -1,6 +1,6 @@
 // Pure tree layout for the agent graph: left-to-right tidy tree, parents
 // centered on their visible children. No React, so it is easy to test.
-import type { GraphNode, NodeStatus } from "./server";
+import type { GraphNode, NodeStatus } from "./contract";
 
 export const NODE_WIDTH = 240;
 export const NODE_HEIGHT = 58;

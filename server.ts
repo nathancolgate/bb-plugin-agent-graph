@@ -7,65 +7,16 @@
 //
 // Timelines are read loosely (as records) so new row kinds degrade to a
 // generic "tool" node instead of breaking the graph.
-import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
-import { z } from "zod";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import {
+  OVERVIEW_TAG,
+  rpcContract,
+  threadTag,
+  type Graph,
+  type GraphNode,
+  type NodeStatus,
+} from "./contract";
 import { normalizeTurns, type Row } from "./timeline";
-import { GRAPH_CHANGED, type GraphChangedPayload } from "./shared";
-
-const nodeKindSchema = z.enum([
-  "root",
-  "project",
-  "thread",
-  "turn",
-  "tool",
-  "subagent",
-  "workflow",
-  "agent",
-  "more",
-]);
-const nodeStatusSchema = z.enum([
-  "running",
-  "waiting",
-  "queued",
-  "done",
-  "error",
-  "interrupted",
-  "idle",
-]);
-const graphNodeSchema = z.object({
-  id: z.string(),
-  parentId: z.string().nullable(),
-  kind: nodeKindSchema,
-  label: z.string(),
-  sublabel: z.string().nullable(),
-  status: nodeStatusSchema,
-  threadId: z.string().nullable(),
-  startedAt: z.number().nullable(),
-  completedAt: z.number().nullable(),
-  input: z.string().nullable(),
-  output: z.string().nullable(),
-  meta: z.record(z.string(), z.string()),
-});
-export type GraphNode = z.infer<typeof graphNodeSchema>;
-export type NodeKind = z.infer<typeof nodeKindSchema>;
-export type NodeStatus = z.infer<typeof nodeStatusSchema>;
-
-const graphSchema = z.object({
-  nodes: z.array(graphNodeSchema),
-  generatedAt: z.number(),
-  truncated: z.boolean(),
-});
-export type Graph = z.infer<typeof graphSchema>;
-
-export const rpcContract = defineRpcContract({
-  graph: {
-    input: z.object({
-      threadId: z.string().nullable(),
-    }),
-    output: graphSchema,
-  },
-});
-
 
 type ThreadDto = {
   id: string;
@@ -88,7 +39,10 @@ const LABEL_CAP = 80;
 const MAX_WORK_PER_TURN = 40;
 const OVERVIEW_WORK_LIMIT = 6;
 const MAX_NODES = 1500;
-const RUNNING_THREAD_STATUSES = new Set(["active", "starting", "pending"]);
+// The statuses bb.sdk.threads.listRunning() reports. A `pending` thread has
+// not dispatched its first message yet (for example a scheduled send), so it
+// is queued, not running.
+const RUNNING_THREAD_STATUSES = new Set(["active", "starting"]);
 const DELTA_EVENTS = new Set([
   "item/agentMessage/delta",
   "item/reasoning/summaryTextDelta",
@@ -148,6 +102,7 @@ function threadStatus(thread: ThreadDto): NodeStatus {
   if (thread.hasPendingInteraction) return "waiting";
   if (thread.status === "error") return "error";
   if (RUNNING_THREAD_STATUSES.has(thread.status)) return "running";
+  if (thread.status === "pending") return "queued";
   if (thread.queuedWork !== undefined && thread.queuedWork !== "none")
     return "queued";
   return "idle";
@@ -505,7 +460,7 @@ export default async function plugin(bb: BbPluginApi) {
   settings.onChange((next) => {
     config = parseConfig(next);
     buildCache.clear();
-    bb.realtime.publish(GRAPH_CHANGED, { threadIds: [] } satisfies GraphChangedPayload);
+    bb.rpc.experimental_invalidateAll();
   });
 
   // A thread's updatedAt does not move while a turn streams, so it is only
@@ -603,12 +558,11 @@ export default async function plugin(bb: BbPluginApi) {
     turns: number,
   ) {
     const ordered: ThreadDto[] = [];
-    const visit = (thread: ThreadDto, depth: number) => {
+    const visit = (thread: ThreadDto) => {
       ordered.push(thread);
-      if (depth > 4) return;
-      for (const child of byParent.get(thread.id) ?? []) visit(child, depth + 1);
+      for (const child of byParent.get(thread.id) ?? []) visit(child);
     };
-    threads.forEach((thread) => visit(thread, 0));
+    threads.forEach(visit);
     const rows = await mapLimited(ordered, 4, (thread) =>
       timelineRows(thread, turns),
     );
@@ -629,30 +583,53 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
-  async function allThreads(): Promise<ThreadDto[]> {
-    const result = (await bb.sdk.threads.list({
+  /**
+   * The newest unarchived threads, plus every running thread. The list is a
+   * fixed page, so running threads past it are read by id.
+   */
+  async function overviewCandidates(): Promise<ThreadDto[]> {
+    const [listed, running] = await Promise.all([
+      bb.sdk.threads.list({ archived: false, limit: 300 }) as unknown as Promise<
+        ThreadDto[]
+      >,
+      bb.sdk.threads.listRunning(),
+    ]);
+    const listedIds = new Set(listed.map((thread) => thread.id));
+    const missing = running
+      .map((thread) => thread.id)
+      .filter((id) => !listedIds.has(id))
+      .slice(0, 200);
+    if (missing.length === 0) return listed;
+    const extra = (await bb.sdk.threads.list({
       archived: false,
-      limit: 300,
+      threadIds: missing,
     })) as unknown as ThreadDto[];
-    return Array.isArray(result) ? result : [];
+    return [...listed, ...extra];
   }
 
   async function buildOverview(): Promise<Graph> {
     const builder = new GraphBuilder(OVERVIEW_WORK_LIMIT);
     const [threads, projects] = await Promise.all([
-      allThreads(),
+      overviewCandidates(),
       bb.sdk.projects.list({ includePersonal: true }) as unknown as Promise<
         Array<{ id: string; name?: string | null }>
       >,
     ]);
     const cutoff = Date.now() - config.windowHours * 3_600_000;
+    const isRunning = (thread: ThreadDto) => threadStatus(thread) === "running";
+    // Running threads always make the cut; the rest fill up newest first.
     const recent = threads
       .filter(
         (thread) =>
           threadStatus(thread) !== "idle" || thread.updatedAt >= cutoff,
       )
-      .sort((a, b) => b.updatedAt - a.updatedAt)
-      .slice(0, Math.max(1, config.maxThreads));
+      .sort(
+        (a, b) =>
+          Number(isRunning(b)) - Number(isRunning(a)) ||
+          b.updatedAt - a.updatedAt,
+      )
+      .slice(0, Math.max(1, config.maxThreads))
+      .sort((a, b) => b.updatedAt - a.updatedAt);
     const included = new Set(recent.map((thread) => thread.id));
     const byParent = new Map<string, ThreadDto[]>();
     for (const thread of recent) {
@@ -725,26 +702,37 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function buildThread(threadId: string): Promise<Graph> {
     const builder = new GraphBuilder();
-    const root = (await bb.sdk.threads.get({ threadId })) as unknown as ThreadDto;
+    const [root, tree] = await Promise.all([
+      bb.sdk.threads.get({ threadId }) as unknown as Promise<ThreadDto>,
+      bb.sdk.threads.experimental_listDescendants({
+        threadIds: [threadId],
+        includeArchived: true,
+        includeHidden: true,
+      }),
+    ]);
+    // One recursive read for the whole tree, then its rows 200 ids at a time.
+    const descendantIds = tree.threads[0]?.descendantIds ?? [];
+    const chunks: string[][] = [];
+    for (let index = 0; index < descendantIds.length; index += 200) {
+      chunks.push(descendantIds.slice(index, index + 200));
+    }
+    const descendants = (
+      await Promise.all(
+        chunks.map(
+          (threadIds) =>
+            bb.sdk.threads.list({
+              threadIds,
+              includeHidden: true,
+            }) as unknown as Promise<ThreadDto[]>,
+        ),
+      )
+    ).flat();
     const byParent = new Map<string, ThreadDto[]>();
-    // Walk descendants breadth-first, a few levels deep.
-    let frontier = [root.id];
-    for (let depth = 0; depth < 4 && frontier.length > 0; depth++) {
-      const levels = await mapLimited(frontier, 4, async (parentThreadId) => {
-        const children = (await bb.sdk.threads.list({
-          parentThreadId,
-          includeHidden: true,
-          limit: 100,
-        })) as unknown as ThreadDto[];
-        return { parentThreadId, children: Array.isArray(children) ? children : [] };
-      });
-      const next: string[] = [];
-      for (const { parentThreadId, children } of levels) {
-        if (children.length === 0) continue;
-        byParent.set(parentThreadId, children);
-        next.push(...children.map((child) => child.id));
-      }
-      frontier = next;
+    for (const thread of descendants.sort((a, b) => b.createdAt - a.createdAt)) {
+      if (thread.parentThreadId === null) continue;
+      const siblings = byParent.get(thread.parentThreadId) ?? [];
+      siblings.push(thread);
+      byParent.set(thread.parentThreadId, siblings);
     }
     await addThreadTree(
       builder,
@@ -760,7 +748,7 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  // Every open window asks for the graph on the same realtime signal, so
+  // Every open window asks for the graph on the same invalidation, so
   // share one in-flight build per scope and reuse it for a moment after.
   const BUILD_MEMO_MS = 750;
   const buildCache = new Map<string, { at: number; promise: Promise<Graph> }>();
@@ -782,11 +770,24 @@ export default async function plugin(bb: BbPluginApi) {
     graph: ({ threadId }) => graphFor(threadId),
   });
 
-  // Live updates: coalesce thread changes and tell open graphs to refetch.
-  // Streaming deltas are skipped; item start/complete events carry the
-  // structural changes the graph draws.
-  const pending = new Set<string>();
+  // Live updates: coalesce thread changes and refresh the graphs that show
+  // them. The overview depends on every thread; a thread graph is tagged with
+  // each thread it shows. Streaming deltas are skipped; item start/complete
+  // events carry the structural changes the graph draws.
+  const staleThreads = new Set<string>();
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
+  function markStale(threadIds: Array<string | null>) {
+    for (const threadId of threadIds) {
+      if (threadId !== null) staleThreads.add(threadId);
+    }
+    buildCache.clear();
+    flushTimer ??= setTimeout(() => {
+      flushTimer = null;
+      const tags = [OVERVIEW_TAG, ...[...staleThreads].map(threadTag)];
+      staleThreads.clear();
+      bb.rpc.experimental_invalidate(tags);
+    }, 600);
+  }
   const unsubscribe = bb.sdk.subscribe({
     event: "thread:changed",
     callback: (event) => {
@@ -798,19 +799,25 @@ export default async function plugin(bb: BbPluginApi) {
       ) {
         return;
       }
-      if (event.id) {
-        timelineCache.delete(event.id);
+      if (!event.id) {
         buildCache.clear();
-        pending.add(event.id);
+        bb.rpc.experimental_invalidateAll();
+        return;
       }
-      flushTimer ??= setTimeout(() => {
-        flushTimer = null;
-        const threadIds = [...pending];
-        pending.clear();
-        bb.realtime.publish(GRAPH_CHANGED, { threadIds } satisfies GraphChangedPayload);
-      }, 600);
+      timelineCache.delete(event.id);
+      markStale([event.id]);
     },
   });
+  // A new or moved thread changes the graphs its parents are in.
+  bb.events.on("thread.created", ({ thread }) => {
+    markStale([thread.parentThreadId]);
+  });
+  bb.events.on(
+    "experimental_thread.parentChanged",
+    ({ thread, previousParentThreadId }) => {
+      markStale([thread.parentThreadId, previousParentThreadId]);
+    },
+  );
   bb.onDispose(() => {
     unsubscribe();
     if (flushTimer !== null) clearTimeout(flushTimer);

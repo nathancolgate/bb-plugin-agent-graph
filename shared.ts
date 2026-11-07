@@ -2,14 +2,6 @@
 // graph.tsx). Keep this file free of server-only imports: the frontend
 // bundle includes it.
 
-/** Realtime channel the server publishes on when the graph may have changed. */
-export const GRAPH_CHANGED = "graph-changed";
-
-export interface GraphChangedPayload {
-  /** Threads that changed; empty means "anything may have changed". */
-  threadIds: string[];
-}
-
 export function readStorage(key: string): string | null {
   try {
     return window.localStorage.getItem(key);

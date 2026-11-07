@@ -14,7 +14,7 @@ import type {
   PointerEvent as ReactPointerEvent,
   ReactNode,
 } from "react";
-import type { Graph, GraphNode, NodeKind, NodeStatus } from "./server";
+import type { Graph, GraphNode, NodeKind, NodeStatus } from "./contract";
 import {
   childrenIndex,
   filterActive,
